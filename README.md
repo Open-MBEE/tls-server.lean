@@ -84,7 +84,7 @@ What may be shared between tasks and what may not:
   has gone makes `write` fail with a message instead of ending the program. If the program relies on
   `SIGPIPE`, do not use `TlsServer` in it.
 
-Lifetimes: a `Listener` closes its socket when dropped or at `closeListener`; a `Connection` closes at
+Lifetimes: a `Listener` closes its socket when dropped or at `closeListener` (which may be called from another task: an `accept` waiting then fails); a `Connection` closes at
 `close` or when dropped; `close`/`closeListener` are idempotent; `read`/`write` after `close` and
 `accept` after `closeListener` fail with a message (never a crash). Errors are `EIO String`, the
 message OpenSSL's or `strerror`'s.
@@ -116,7 +116,7 @@ the first check off — for a throwaway test only; hostname matching cannot be t
 What is *verified* here and how:
 
 * by test (`lake test`): the certificate is made, a connection served, fetched by
-  curl with that certificate as its anchor, the key's mode 600, read and write after `close` refused, a client that does not trust the certificate refused, `accept` after `closeListener` refused;
+  curl with that certificate as its anchor, the key's mode 600, read and write after `close` refused, a client that does not trust the certificate refused, `accept` after `closeListener` refused, a common name over 64 bytes refused with no certificate written, an empty read when the client goes without `close_notify`, an `accept` waiting when another task calls `closeListener` refused;
 * by construction in Lean: the API's types — `Context`, `Listener`, `Connection` are opaque, every
   operation is in `TlsIO`, so nothing but these functions touches the native state;
 * **trusted, not verified**: OpenSSL (handshake, record layer, path validation), the client (hostname

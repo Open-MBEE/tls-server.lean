@@ -28,8 +28,12 @@ struct Conn {
   int fd;
 };
 
+// `mu` guards fd, accepting and closed; the descriptor is closed only when no accept is using it.
 struct Lst {
+  pthread_mutex_t mu;
   int fd;
+  int accepting;
+  bool closed;
   uint16_t port;
 };
 
@@ -64,6 +68,7 @@ static void conn_finalizer(void *p) {
 static void lst_finalizer(void *p) {
   Lst *l = static_cast<Lst *>(p);
   if (l->fd >= 0) close(l->fd);
+  pthread_mutex_destroy(&l->mu);
   free(l);
 }
 static void noop_foreach(void *, b_lean_obj_arg) {}
@@ -114,7 +119,9 @@ extern "C" LEAN_EXPORT lean_object *lean_tls_self_signed(b_lean_obj_arg cn, b_le
   X509_gmtime_adj(X509_getm_notAfter(crt), (long)days * 24 * 60 * 60);
   X509_set_pubkey(crt, key);
   X509_NAME *name = X509_get_subject_name(crt);
-  X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC, (const unsigned char *)lean_string_cstr(cn), -1, -1, 0);
+  if (X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC, (const unsigned char *)lean_string_cstr(cn), -1, -1, 0) != 1) {
+    X509_free(crt); EVP_PKEY_free(key); return fail("common name rejected:", lean_string_cstr(cn));
+  }
   X509_set_issuer_name(crt, name);
   X509V3_CTX v3;
   X509V3_set_ctx_nodb(&v3);
@@ -158,7 +165,10 @@ extern "C" LEAN_EXPORT lean_object *lean_tls_listen(b_lean_obj_arg host, uint32_
   socklen_t len = sizeof addr;
   if (getsockname(fd, (struct sockaddr *)&addr, &len) != 0) { int e = errno; close(fd); errno = e; return fail("getsockname failed"); }
   Lst *l = (Lst *)malloc(sizeof *l);
+  pthread_mutex_init(&l->mu, nullptr);
   l->fd = fd;
+  l->accepting = 0;
+  l->closed = false;
   l->port = ntohs(addr.sin_port);
   return lean_io_result_mk_ok(lean_alloc_external(g_tls_lst_class, l));
 }
@@ -168,10 +178,17 @@ extern "C" LEAN_EXPORT uint32_t lean_tls_listener_port(b_lean_obj_arg lst) {
   return static_cast<Lst *>(lean_get_external_data(lst))->port;
 }
 
-// lean_tls_listener_close l: the listening socket closed; a later accept fails.
+// lean_tls_listener_close l: the listening socket closed; a later accept fails, and one in progress is
+// woken by shutdown and closes the descriptor on its way out.
 extern "C" LEAN_EXPORT lean_object *lean_tls_listener_close(b_lean_obj_arg lst, lean_obj_arg /* w */) {
   Lst *l = static_cast<Lst *>(lean_get_external_data(lst));
-  if (l->fd >= 0) { close(l->fd); l->fd = -1; }
+  pthread_mutex_lock(&l->mu);
+  if (!l->closed) {
+    l->closed = true;
+    if (l->accepting > 0) shutdown(l->fd, SHUT_RDWR);
+    else { close(l->fd); l->fd = -1; }
+  }
+  pthread_mutex_unlock(&l->mu);
   return lean_io_result_mk_ok(lean_box(0));
 }
 
@@ -197,12 +214,22 @@ extern "C" LEAN_EXPORT lean_object *lean_tls_server_context(b_lean_obj_arg certP
 extern "C" LEAN_EXPORT lean_object *lean_tls_accept(b_lean_obj_arg ctx, b_lean_obj_arg lst, lean_obj_arg /* w */) {
   errno = 0;
   Lst *l = static_cast<Lst *>(lean_get_external_data(lst));
-  if (l->fd < 0) return fail("listener closed");
-  int c = accept(l->fd, nullptr, nullptr);
-  if (c < 0) return fail("accept failed");
+  pthread_mutex_lock(&l->mu);
+  if (l->closed) { pthread_mutex_unlock(&l->mu); return fail("listener closed"); }
+  int fd = l->fd;
+  l->accepting++;
+  pthread_mutex_unlock(&l->mu);
+  int c = accept(fd, nullptr, nullptr);
+  int e = errno;
+  pthread_mutex_lock(&l->mu);
+  bool closed = l->closed;
+  if (--l->accepting == 0 && closed && l->fd >= 0) { close(l->fd); l->fd = -1; }
+  pthread_mutex_unlock(&l->mu);
+  if (c < 0) { errno = closed ? 0 : e; return fail(closed ? "listener closed" : "accept failed"); }
   SSL *ssl = SSL_new(static_cast<SSL_CTX *>(lean_get_external_data(ctx)));
   if (!ssl) { close(c); return fail("SSL_new failed"); }
   SSL_set_fd(ssl, c);
+  ERR_clear_error();
   if (SSL_accept(ssl) != 1) { SSL_free(ssl); close(c); return fail("handshake failed"); }
   Conn *conn = (Conn *)malloc(sizeof *conn);
   conn->ssl = ssl;
@@ -210,18 +237,30 @@ extern "C" LEAN_EXPORT lean_object *lean_tls_accept(b_lean_obj_arg ctx, b_lean_o
   return lean_io_result_mk_ok(lean_alloc_external(g_tls_conn_class, conn));
 }
 
+// OpenSSL 3 reports a TCP close without close_notify as this SSL error, not as SSL_ERROR_SYSCALL.
+static bool unexpected_eof() {
+#ifdef SSL_R_UNEXPECTED_EOF_WHILE_READING
+  unsigned long e = ERR_peek_error();
+  return ERR_GET_LIB(e) == ERR_LIB_SSL && ERR_GET_REASON(e) == SSL_R_UNEXPECTED_EOF_WHILE_READING;
+#else
+  return false;
+#endif
+}
+
 // lean_tls_read conn max: up to `max` bytes of application data (RFC 8446 §5.1 / RFC 5246 §6.2); empty
 // once the peer has closed: its close_notify (RFC 8446 §6.1 / RFC 5246 §7.2.1, SSL_ERROR_ZERO_RETURN)
-// or its TCP connection gone (SSL_ERROR_SYSCALL with 0).
+// or its TCP connection gone (SSL_ERROR_SYSCALL with 0, or OpenSSL 3's unexpected-EOF error).
 extern "C" LEAN_EXPORT lean_object *lean_tls_read(b_lean_obj_arg conn, uint32_t max, lean_obj_arg /* w */) {
   errno = 0;
   Conn *c = static_cast<Conn *>(lean_get_external_data(conn));
   if (!c->ssl) return fail("connection closed");
   lean_object *bytes = lean_alloc_sarray(1, 0, max);
+  ERR_clear_error();
   int n = SSL_read(c->ssl, lean_sarray_cptr(bytes), (int)max);
   if (n <= 0) {
     int err = SSL_get_error(c->ssl, n);
-    if (err == SSL_ERROR_ZERO_RETURN || (err == SSL_ERROR_SYSCALL && n == 0)) {
+    if (err == SSL_ERROR_ZERO_RETURN || (err == SSL_ERROR_SYSCALL && n == 0) ||
+        (err == SSL_ERROR_SSL && unexpected_eof())) {
       ERR_clear_error();
       return lean_io_result_mk_ok(bytes);
     }
@@ -240,6 +279,7 @@ extern "C" LEAN_EXPORT lean_object *lean_tls_write(b_lean_obj_arg conn, b_lean_o
   size_t size = lean_sarray_size(bytes), done = 0;
   const uint8_t *data = lean_sarray_cptr(bytes);
   while (done < size) {
+    ERR_clear_error();
     int n = SSL_write(c->ssl, data + done, (int)(size - done));
     if (n <= 0) return fail("write failed");
     done += n;
@@ -252,7 +292,13 @@ extern "C" LEAN_EXPORT lean_object *lean_tls_write(b_lean_obj_arg conn, b_lean_o
 // with "connection closed".
 extern "C" LEAN_EXPORT lean_object *lean_tls_close(b_lean_obj_arg conn, lean_obj_arg /* w */) {
   Conn *c = static_cast<Conn *>(lean_get_external_data(conn));
-  if (c->ssl) { SSL_shutdown(c->ssl); SSL_free(c->ssl); c->ssl = nullptr; }
+  if (c->ssl) {
+    ERR_clear_error();
+    SSL_shutdown(c->ssl);
+    ERR_clear_error();
+    SSL_free(c->ssl);
+    c->ssl = nullptr;
+  }
   if (c->fd >= 0) { close(c->fd); c->fd = -1; }
   return lean_io_result_mk_ok(lean_box(0));
 }
