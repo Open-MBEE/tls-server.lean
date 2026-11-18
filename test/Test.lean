@@ -1,7 +1,7 @@
 import TlsServer.Protocol
 
 /-! `lake test`: a self-signed certificate, one connection served over https on the loopback and fetched
-by the `curl` program with that certificate as its CA; then the key's mode and the refusals. -/
+by the `curl` program with that certificate as its CA; then the key's mode, the refusals, and the two ways a client can close. -/
 
 open scoped TlsServer
 
@@ -52,3 +52,56 @@ def main : IO Unit := do
   TlsServer.closeListener l
   TlsServer.closeListener l
   check "accept after closeListener is refused" (← refused (TlsServer.accept ctx l))
+  let longCn := String.ofList (List.replicate 65 'a')
+  let longCert := s!"{dir}/long-cert.pem"
+  -- an OpenSSL error left pending on the task does not turn a later clean close into a read error
+  let l ← TlsServer.listen "127.0.0.1" 0
+  let url := s!"https://127.0.0.1:{TlsServer.port l}/"
+  let stale ← IO.asTask (prio := .dedicated) <| (do
+    let c ← TlsServer.accept ctx l
+    let _ ← TlsServer.read c
+    TlsServer.write c "HTTP/1.0 204 No Content\r\nConnection: close\r\n\r\n".toUTF8
+    let cnRefused ← (refused (TlsServer.selfSigned longCn "DNS:localhost" 1 longCert s!"{dir}/long-key.pem") : IO Bool)
+    let atClose ← TlsServer.read c
+    TlsServer.close c
+    pure (cnRefused, atClose.size) : IO _)
+  let _ ← IO.Process.run { cmd := "curl", args := #["--silent", "--show-error", "--cacert", cert, url] }
+  let (cnRefused, atClose) ← IO.ofExcept (← IO.wait stale)
+  check "a common name over 64 bytes is refused" cnRefused
+  check "and no certificate is written for it" (!(← System.FilePath.pathExists longCert))
+  check "the read at the client's close_notify that follows is empty" (atClose == 0)
+  -- a client killed mid-request closes its TCP connection without close_notify
+  let seen ← IO.mkRef false
+  let gone ← IO.mkRef false
+  let cut ← IO.asTask (prio := .dedicated) <| (do
+    let c ← TlsServer.accept ctx l
+    let _ ← TlsServer.read c
+    seen.set true
+    while !(← gone.get) do IO.sleep 20
+    let atEof ← TlsServer.read c
+    let again ← TlsServer.read c
+    TlsServer.close c
+    pure (atEof.size, again.size) : IO _)
+  let child ← IO.Process.spawn { cmd := "curl", args := #["--silent", "--cacert", cert, url], stdout := .null, stderr := .null }
+  while !(← seen.get) do IO.sleep 20
+  child.kill
+  let _ ← child.wait
+  gone.set true
+  let (atEof, again) ← IO.ofExcept (← IO.wait cut)
+  check "the read after the client's TCP connection is gone is empty" (atEof == 0)
+  check "and so is the read after that" (again == 0)
+  -- closeListener from another task ends an accept that is waiting
+  let waiting ← IO.asTask (prio := .dedicated) <| refused (TlsServer.accept ctx l)
+  IO.sleep 200
+  TlsServer.closeListener l
+  check "an accept waiting when the listener is closed is refused" (← IO.ofExcept (← IO.wait waiting))
+  -- closeListener also ends an accept whose client connected and then sent nothing
+  let l ← TlsServer.listen "127.0.0.1" 0
+  let silent ← IO.Process.spawn
+    { cmd := "bash", args := #["-c", s!"exec 3<>/dev/tcp/127.0.0.1/{TlsServer.port l}; read -t 30 <&3"], stdout := .null, stderr := .null }
+  let handshaking ← IO.asTask (prio := .dedicated) <| refused (TlsServer.accept ctx l)
+  IO.sleep 300
+  TlsServer.closeListener l
+  check "an accept in its handshake when the listener is closed is refused" (← IO.ofExcept (← IO.wait handshaking))
+  silent.kill
+  let _ ← silent.wait
