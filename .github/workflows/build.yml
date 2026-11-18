@@ -1,0 +1,26 @@
+name: build
+# Runs unchanged on github.com/Open-MBEE and on its mirror: self-hosted runner, push and manual runs
+# only (never a fork's pull request), actions pinned to commits, elan from the local action.
+# The runner needs a C++ compiler, OpenSSL's headers (libssl-dev) and the curl program.
+on:
+  push:
+    branches: [develop, main]
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: self-hosted
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4.3.0
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/elan
+      - name: build the library and its protocol model
+        run: lake build
+      - name: test (one https round trip on the loopback, and the refusals)
+        run: lake test
