@@ -248,7 +248,8 @@ extern "C" LEAN_EXPORT lean_object *lean_tls_accept(b_lean_obj_arg ctx, b_lean_o
     if (*p == &self) { *p = self.next; break; }
   closed = l->closed;
   pthread_mutex_unlock(&l->mu);
-  if (!ok) {
+  // closed here means closeListener shut this socket down, even if the handshake had just finished
+  if (!ok || closed) {
     if (ssl) SSL_free(ssl);
     close(c);
     if (closed) { ERR_clear_error(); errno = 0; return fail("listener closed"); }
