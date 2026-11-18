@@ -122,3 +122,7 @@ What is *verified* here and how:
 * **trusted, not verified**: OpenSSL (handshake, record layer, path validation), the client (hostname
   matching), the C shim `native/leantls.cpp` (≈250 lines, reviewed), the Lean runtime's external
   objects. No Lean theorem speaks about these, and none should be read as doing so.
+
+## License
+
+Apache-2.0. See [LICENSE](LICENSE).
