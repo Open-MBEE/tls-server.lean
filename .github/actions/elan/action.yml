@@ -1,0 +1,32 @@
+name: Lean toolchain manager (elan)
+description: >
+  Puts elan on the PATH, installing it when the runner does not have it. Lake then fetches the
+  toolchain that lean-toolchain names. A local action, so it runs where only enterprise-owned
+  actions are allowed.
+
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        ELAN_VERSION: v4.2.4
+        # sha256 of elan-<arch>-unknown-linux-gnu.tar.gz in that release
+        ELAN_SHA256_x86_64: 42b94d4244e8353142c456ec0e4ca6528fd898a6c604d4059f494e706e431f63
+        ELAN_SHA256_aarch64: 05febd124d84ebf994b2e7479922a5650b1e950c17ae3bd1ddd776b65bb72bf9
+      run: |
+        set -euo pipefail
+        if ! command -v elan >/dev/null && [ ! -x "$HOME/.elan/bin/elan" ]; then
+          # the release's installer, run only if it has the digest recorded above
+          arch=$(uname -m)
+          sha=ELAN_SHA256_$arch
+          [ -n "${!sha:-}" ] || { echo "::error::no elan digest recorded for $(uname -s) $arch; install elan on the runner"; exit 1; }
+          tmp=$(mktemp -d)
+          curl -sSfL -o "$tmp/elan.tar.gz" \
+            "https://github.com/leanprover/elan/releases/download/$ELAN_VERSION/elan-$arch-unknown-linux-gnu.tar.gz"
+          echo "${!sha}  $tmp/elan.tar.gz" | sha256sum -c -
+          tar -xzf "$tmp/elan.tar.gz" -C "$tmp"
+          "$tmp/elan-init" -y --default-toolchain none
+          rm -rf "$tmp"
+        fi
+        echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+        PATH="$HOME/.elan/bin:$PATH" elan --version
