@@ -79,16 +79,29 @@ def main : IO Unit := do
     seen.set true
     while !(← gone.get) do IO.sleep 20
     let atEof ← TlsServer.read c
+    let again ← TlsServer.read c
     TlsServer.close c
-    pure atEof.size : IO _)
+    pure (atEof.size, again.size) : IO _)
   let child ← IO.Process.spawn { cmd := "curl", args := #["--silent", "--cacert", cert, url], stdout := .null, stderr := .null }
   while !(← seen.get) do IO.sleep 20
   child.kill
   let _ ← child.wait
   gone.set true
-  check "the read after the client's TCP connection is gone is empty" ((← IO.ofExcept (← IO.wait cut)) == 0)
+  let (atEof, again) ← IO.ofExcept (← IO.wait cut)
+  check "the read after the client's TCP connection is gone is empty" (atEof == 0)
+  check "and so is the read after that" (again == 0)
   -- closeListener from another task ends an accept that is waiting
   let waiting ← IO.asTask (prio := .dedicated) <| refused (TlsServer.accept ctx l)
   IO.sleep 200
   TlsServer.closeListener l
   check "an accept waiting when the listener is closed is refused" (← IO.ofExcept (← IO.wait waiting))
+  -- closeListener also ends an accept whose client connected and then sent nothing
+  let l ← TlsServer.listen "127.0.0.1" 0
+  let silent ← IO.Process.spawn
+    { cmd := "bash", args := #["-c", s!"exec 3<>/dev/tcp/127.0.0.1/{TlsServer.port l}; read -t 30 <&3"], stdout := .null, stderr := .null }
+  let handshaking ← IO.asTask (prio := .dedicated) <| refused (TlsServer.accept ctx l)
+  IO.sleep 300
+  TlsServer.closeListener l
+  check "an accept in its handshake when the listener is closed is refused" (← IO.ofExcept (← IO.wait handshaking))
+  silent.kill
+  let _ ← silent.wait
